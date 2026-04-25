@@ -284,13 +284,7 @@ def _draw_train_shape(fig, tr, pk, phase, y_center):
         body_x0, body_x1 = pk + L * 0.25, pk + L
         nose_x0, nose_x1 = pk, pk + L * 0.25
 
-    h = 0.18
-
-    # Bande de phase (sous le train) — couleur indiquant le mode
-    fig.add_shape(type="rect",
-                  x0=min(body_x0, nose_x0) - 0.5, x1=max(body_x1, nose_x1) + 0.5,
-                  y0=y_center - h - 0.06, y1=y_center - h - 0.02,
-                  fillcolor=phase_color, line_width=0)
+    h = 0.16
 
     # Corps du train
     fig.add_shape(type="rect",
@@ -320,16 +314,19 @@ def _draw_train_shape(fig, tr, pk, phase, y_center):
                       y0=y_center + h * 0.15, y1=y_center + h * 0.65,
                       fillcolor="rgba(255,255,255,0.85)", line_width=0)
 
-    # Étiquette nom + vitesse
-    speed_text = (f"{int(PHASE_SPEED_KMH[phase])} km/h"
-                  if phase != "coast" else "↘ erre")
+    # Étiquette nom + phase, dans une boîte blanche pour la lisibilité.
+    label_y = y_center + h + 0.22 if tr.direction == +1 else y_center - h - 0.22
     fig.add_annotation(
         x=(body_x0 + nose_x1) / 2,
-        y=y_center + h + 0.18,
-        text=f"<b>{tr.name}</b> · {tr.composition}<br>"
-             f"<span style='color:{phase_color}'>{PHASE_LABELS_FR[phase]} ({speed_text})</span>",
-        showarrow=False, font=dict(size=11),
+        y=label_y,
+        text=f"<b style='color:{dark}'>{tr.name}</b> "
+             f"<span style='color:#7f8c8d'>· {tr.composition}</span><br>"
+             f"<span style='color:{phase_color};font-weight:600'>"
+             f"● {PHASE_LABELS_FR[phase]}</span>",
+        showarrow=False, font=dict(size=11, color="#2c3e50"),
         align="center",
+        bgcolor="rgba(255,255,255,0.95)",
+        bordercolor=color, borderwidth=1, borderpad=4,
     )
 
 
@@ -340,17 +337,21 @@ def build_track_map(trains, now, intersection_range, meeting):
     for sst in SUBSTATIONS:
         fig.add_shape(type="rect",
                       x0=sst["pk_start"], x1=sst["pk_end"],
-                      y0=-1.1, y1=1.1,
+                      y0=-1.3, y1=1.3,
                       fillcolor=sst["fill"], line_width=0, layer="below")
+        ps_txt = f"{sst['kva_souscrite']:,}".replace(",", " ")
         fig.add_annotation(
-            x=(sst["pk_start"] + sst["pk_end"]) / 2, y=1.0,
-            text=f"<b style='color:{sst['color']}'>{sst['secteur']}</b><br>"
-                 f"{sst['name']} · PS {sst['kva_souscrite']:,} KVA".replace(",", " "),
-            showarrow=False, font=dict(size=12),
+            x=(sst["pk_start"] + sst["pk_end"]) / 2, y=1.15,
+            text=f"<b>{sst['secteur']}</b> &nbsp;·&nbsp; "
+                 f"{sst['name']} &nbsp;·&nbsp; PS {ps_txt} KVA",
+            showarrow=False,
+            font=dict(size=12, color=sst["color"], family="sans-serif"),
+            bgcolor="rgba(255,255,255,0.95)",
+            bordercolor=sst["color"], borderwidth=1, borderpad=6,
         )
 
-    # Frontière de secteur (sectionnement)
-    fig.add_shape(type="line", x0=98.4, x1=98.4, y0=-0.9, y1=0.9,
+    # Frontière de secteur (sectionnement) — ligne verticale traversant tout
+    fig.add_shape(type="line", x0=98.4, x1=98.4, y0=-1.4, y1=1.1,
                   line=dict(color="#7f8c8d", width=2, dash="dot"))
 
     # Voie (deux rails représentés par deux lignes)
@@ -366,12 +367,18 @@ def build_track_map(trains, now, intersection_range, meeting):
         fig.add_shape(type="line", x0=pk, x1=pk, y0=-0.07, y1=0.07,
                       line=dict(color="#95a5a6", width=1), layer="below")
 
-    # Points de repère (gares + PCV + zones)
+    # Points de repère (gares + PCV + zones).
+    # Les étiquettes des PCV/zones alternent entre deux niveaux verticaux
+    # pour éviter le chevauchement aux abords du sectionnement.
+    intermediates = [w for w in WAYPOINTS if w["type"] != "gare"]
+    levels = {id(w): (-1.05 if i % 2 == 0 else -1.35)
+              for i, w in enumerate(intermediates)}
+
     for w in WAYPOINTS:
         if w["type"] == "gare":
             sym, sz, col = "square", 16, "#c0392b"
         elif w["type"] == "zone":
-            sym, sz, col = "diamond", 11, "#7f8c8d"
+            sym, sz, col = "diamond", 11, "#5d6d7e"
         else:
             sym, sz, col = "circle", 8, "#34495e"
         fig.add_trace(go.Scatter(
@@ -381,31 +388,44 @@ def build_track_map(trains, now, intersection_range, meeting):
             hovertemplate=f"<b>{w['name']}</b><br>PK {w['pk']:.1f}<extra></extra>",
             showlegend=False,
         ))
-        # Étiquette en bas pour les gares, plus discrète pour les PCV
         if w["type"] == "gare":
-            fig.add_annotation(x=w["pk"], y=-0.55,
+            fig.add_annotation(x=w["pk"], y=-1.20,
                                text=f"<b>{w['name']}</b><br>PK {w['pk']:.0f}",
-                               showarrow=False, font=dict(size=12, color=col))
+                               showarrow=False,
+                               font=dict(size=13, color=col),
+                               bgcolor="rgba(255,255,255,0.95)",
+                               bordercolor=col, borderwidth=1, borderpad=4)
         else:
-            fig.add_annotation(x=w["pk"], y=-0.42,
-                               text=f"{w['name']}<br><i>PK {w['pk']:.1f}</i>",
-                               showarrow=False, font=dict(size=9, color="#7f8c8d"))
+            y_lvl = levels[id(w)]
+            # Tirette grise reliant le marqueur à l'étiquette
+            fig.add_shape(type="line", x0=w["pk"], x1=w["pk"],
+                          y0=-0.06, y1=y_lvl + 0.10,
+                          line=dict(color="#bdc3c7", width=1, dash="dot"),
+                          layer="below")
+            fig.add_annotation(
+                x=w["pk"], y=y_lvl,
+                text=f"<b>{w['name']}</b><br><span style='color:#7f8c8d'>PK {w['pk']:.1f}</span>",
+                showarrow=False,
+                font=dict(size=10, color="#34495e"),
+                bgcolor="rgba(255,255,255,0.92)",
+                bordercolor="#ecf0f1", borderwidth=1, borderpad=3,
+            )
 
-    # Zone de danger
+    # Zone de danger : bandeau vertical rouge couvrant tout le trajet.
     if intersection_range:
         lo, hi = intersection_range
         fig.add_shape(type="rect",
-                      x0=lo, x1=hi, y0=-0.9, y1=0.9,
-                      fillcolor="rgba(231,76,60,0.18)",
+                      x0=lo, x1=hi, y0=-1.6, y1=1.05,
+                      fillcolor="rgba(231,76,60,0.10)",
                       line=dict(color="#c0392b", width=2, dash="dash"),
                       layer="below")
         fig.add_annotation(
-            x=(lo + hi) / 2, y=-0.85,
+            x=(lo + hi) / 2, y=1.45,
             text=f"⚠ <b>Zone de danger</b> · PK {lo:.1f} – {hi:.1f}",
             showarrow=False,
             font=dict(size=12, color="#c0392b"),
-            bgcolor="rgba(255,255,255,0.9)",
-            bordercolor="#c0392b", borderwidth=1, borderpad=4,
+            bgcolor="rgba(255,255,255,0.95)",
+            bordercolor="#c0392b", borderwidth=1, borderpad=5,
         )
 
     # Point de croisement
@@ -418,26 +438,28 @@ def build_track_map(trains, now, intersection_range, meeting):
             showlegend=False,
         ))
 
-    # Trains
+    # Trains : Pair au-dessus de la voie, Impair en-dessous (les têtes
+    # triangulaires donnent en plus le sens visuel).
     for tr in trains:
         pos = tr.position_at(now)
         if pos is None:
             continue
         pk, phase = pos
-        y = 0.40 if tr.direction == +1 else -0.40
+        y = 0.55 if tr.direction == +1 else -0.55
         _draw_train_shape(fig, tr, pk, phase, y)
 
     fig.update_xaxes(
-        title=dict(text="<b>PK (km)</b>", font=dict(size=13)),
-        range=[-5, LGV_LENGTH_KM + 5],
-        showgrid=True, gridcolor="rgba(0,0,0,0.05)",
+        title=dict(text="<b>PK (km)</b>", font=dict(size=13, color="#2c3e50")),
+        range=[-6, LGV_LENGTH_KM + 6],
+        showgrid=True, gridcolor="rgba(0,0,0,0.06)",
         tickmode="linear", dtick=20,
+        tickfont=dict(color="#2c3e50"),
     )
-    fig.update_yaxes(visible=False, range=[-1.2, 1.3])
+    fig.update_yaxes(visible=False, range=[-1.65, 1.65])
     fig.update_layout(
-        height=440,
-        margin=dict(l=20, r=20, t=20, b=40),
-        plot_bgcolor="#fdfdfd", paper_bgcolor="white",
+        height=580,
+        margin=dict(l=20, r=20, t=30, b=50),
+        plot_bgcolor="#ffffff", paper_bgcolor="white",
     )
     return fig
 
@@ -488,8 +510,15 @@ def build_marche_graphique(trains, now, meeting_pt, meeting_t):
             hovertemplate="<b>%{customdata}</b><br>%{x|%H:%M:%S}<br>PK %{y:.1f}<extra></extra>",
         ))
 
-    fig.add_vline(x=now, line=dict(color="#7f8c8d", dash="dash", width=2),
-                  annotation_text="Maintenant", annotation_position="top")
+    # add_vline + annotation_text crashes on datetime axes ; on dessine
+    # explicitement la ligne et l'étiquette « Maintenant ».
+    fig.add_shape(type="line", x0=now, x1=now, yref="paper", y0=0, y1=1,
+                  line=dict(color="#7f8c8d", dash="dash", width=2))
+    fig.add_annotation(x=now, y=1.02, yref="paper",
+                       text="<b>Maintenant</b>", showarrow=False,
+                       font=dict(size=11, color="#7f8c8d"),
+                       bgcolor="rgba(255,255,255,0.9)",
+                       bordercolor="#7f8c8d", borderwidth=1, borderpad=3)
 
     if meeting_pt is not None and meeting_t is not None:
         fig.add_trace(go.Scatter(
@@ -668,12 +697,22 @@ tab1, tab2, tab3 = st.tabs([
 
 with tab1:
     st.markdown(
-        f"<div style='text-align:center;color:#7f8c8d;margin-bottom:0.5rem'>"
-        f"<span class='train-legend' style='background:{TRAIN_BRAND['Train A (Pair)']['primary']}'></span>"
-        f"Train A (Pair · {comp_a} · {prof_a}) &nbsp;&nbsp;"
-        f"<span class='train-legend' style='background:{TRAIN_BRAND['Train B (Impair)']['primary']}'></span>"
-        f"Train B (Impair · {comp_b} · {prof_b})"
-        f"</div>",
+        f"""
+<div style='text-align:center;margin:0.4rem 0 0.8rem 0;'>
+  <span style='display:inline-block;padding:6px 14px;background:#fff;
+               border:1px solid #e1e5ea;border-radius:20px;margin:0 6px;
+               font-size:13px;color:#2c3e50;'>
+    <span class='train-legend' style='background:{TRAIN_BRAND['Train A (Pair)']['primary']}'></span>
+    <b>Train A — Pair</b> · {comp_a} · profil {prof_a} · Tanger → Kenitra
+  </span>
+  <span style='display:inline-block;padding:6px 14px;background:#fff;
+               border:1px solid #e1e5ea;border-radius:20px;margin:0 6px;
+               font-size:13px;color:#2c3e50;'>
+    <span class='train-legend' style='background:{TRAIN_BRAND['Train B (Impair)']['primary']}'></span>
+    <b>Train B — Impair</b> · {comp_b} · profil {prof_b} · Kenitra → Tanger
+  </span>
+</div>
+""",
         unsafe_allow_html=True,
     )
     st.plotly_chart(
@@ -703,24 +742,66 @@ with tab1:
         pct = (kva / limit * 100) if limit else 0
         delta = kva - limit
         with col:
+            kva_txt = f"{kva:,}".replace(",", " ")
+            limit_txt = f"{limit:,}".replace(",", " ")
+            delta_txt = f"{'+' if delta >= 0 else ''}{delta:,}".replace(",", " ")
+            delta_color = "#c0392b" if delta > 0 else "#27ae60"
             st.markdown(
-                f"<div class='metric-card' style='border-left-color:{sst['color']}'>"
-                f"<div style='font-size:14px;color:#7f8c8d'>{sst['secteur']}</div>"
-                f"<div style='font-size:16px;font-weight:600;color:{sst['color']}'>"
-                f"{sst['name']}</div>"
-                f"<div style='font-size:28px;font-weight:700;margin-top:6px'>"
-                f"{kva:,} <span style='font-size:14px;color:#7f8c8d'>KVA</span></div>"
-                f"<div style='color:{'#c0392b' if delta > 0 else '#27ae60'};font-weight:600'>"
-                f"{'+' if delta>=0 else ''}{delta:,} vs PS {limit:,} KVA</div>"
-                f"</div>".replace(",", " "),
+                f"""
+<div style="
+    background:#ffffff;
+    border:1px solid #e1e5ea;
+    border-left:6px solid {sst['color']};
+    border-radius:10px;
+    padding:14px 18px;
+    box-shadow:0 1px 3px rgba(0,0,0,0.04);
+">
+  <div style="font-size:13px;color:#7f8c8d;letter-spacing:0.5px;text-transform:uppercase;">
+    {sst['secteur']}
+  </div>
+  <div style="font-size:17px;font-weight:700;color:{sst['color']};margin-bottom:8px;">
+    {sst['name']}
+  </div>
+  <div style="font-size:34px;font-weight:800;color:#2c3e50;line-height:1.1;">
+    {kva_txt}
+    <span style="font-size:14px;color:#7f8c8d;font-weight:600;">KVA</span>
+  </div>
+  <div style="color:{delta_color};font-weight:700;font-size:14px;margin-top:4px;">
+    {delta_txt} vs PS {limit_txt} KVA
+  </div>
+</div>
+""",
                 unsafe_allow_html=True,
             )
-            st.progress(min(pct / 100, 1.0))
+            bar_color = "#c0392b" if pct > 100 else (
+                "#f39c12" if pct > 80 else "#27ae60")
+            bar_pct = min(pct, 100)
+            st.markdown(
+                f"""
+<div style="
+    background:#ecf0f1;border-radius:6px;height:10px;margin:6px 0 10px 0;
+    overflow:hidden;border:1px solid #d5dbdb;">
+  <div style="background:{bar_color};width:{bar_pct:.1f}%;height:100%;"></div>
+</div>
+<div style="font-size:12px;color:#7f8c8d;margin-bottom:6px;">
+  {pct:.0f}% de la puissance souscrite
+</div>
+""",
+                unsafe_allow_html=True,
+            )
             if info["details"]:
                 for d in info["details"]:
-                    st.caption("• " + d)
+                    st.markdown(
+                        f"<div style='font-size:12px;color:#34495e;"
+                        f"padding:2px 0;'>• {d}</div>",
+                        unsafe_allow_html=True,
+                    )
             else:
-                st.caption("Aucun train dans ce secteur.")
+                st.markdown(
+                    "<div style='font-size:12px;color:#95a5a6;font-style:italic;'>"
+                    "Aucun train dans ce secteur</div>",
+                    unsafe_allow_html=True,
+                )
 
     # Bandeau de risque
     st.markdown(" ")
