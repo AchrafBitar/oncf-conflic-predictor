@@ -613,6 +613,20 @@ with st.sidebar:
     delay_b = st.slider("Retard signalé (min)", -5.0, 15.0, 0.0, 0.5, key="del_b")
 
     st.markdown("---")
+    st.markdown("### ⚡ Puissances souscrites (PS)")
+    st.caption("Ajustables si la souscription est révisée auprès de l'ONEE.")
+    ps_aouama = st.number_input(
+        "AOUAMA SST1 — Secteur Nord (KVA)",
+        min_value=1000, max_value=40000,
+        value=12000, step=500, key="ps_aouama",
+    )
+    ps_oulad = st.number_input(
+        "OULAD SLAMA SST2 — Secteur Sud (KVA)",
+        min_value=1000, max_value=40000,
+        value=14500, step=500, key="ps_oulad",
+    )
+
+    st.markdown("---")
     st.markdown("### ▶️ Lecture")
     sim_speed = st.slider("Vitesse simulation (× réel)", 1, 240, 60)
     run_sim = st.toggle("Lancer la simulation", value=False)
@@ -620,6 +634,10 @@ with st.sidebar:
         st.session_state.pop("sim_clock", None)
         st.session_state.pop("sim_anchor", None)
 
+
+# ---------- Application des PS saisies ----------
+SUBSTATIONS[0]["kva_souscrite"] = int(ps_aouama)
+SUBSTATIONS[1]["kva_souscrite"] = int(ps_oulad)
 
 # ---------- Construction des trains ----------
 dep_a_dt = datetime.combine(today.date(), dep_a)
