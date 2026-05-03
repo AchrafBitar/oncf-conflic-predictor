@@ -47,19 +47,60 @@ SUBSTATIONS = [
         "name": "AOUAMA SST1",
         "secteur": "Secteur Nord",
         "pk_start": 0.0, "pk_end": 98.4,
-        "kva_souscrite": 12000,
+        "kva_souscrite": 12500,   # PS prévue hiver 2026 (rapport déc. 2025)
         "color": "#3498db",
         "fill": "rgba(52,152,219,0.12)",
     },
     {
-        "name": "OULAD SLAMA SST2",
+        "name": "OULED SLAMA SST2",
         "secteur": "Secteur Sud",
         "pk_start": 98.4, "pk_end": LGV_LENGTH_KM,
-        "kva_souscrite": 14500,
+        "kva_souscrite": 16000,   # PS prévue hiver 2026
         "color": "#e67e22",
         "fill": "rgba(230,126,34,0.12)",
     },
 ]
+
+# MOGHOGHA n'est pas sur la LGV : elle alimente la zone Tanger LC
+# (approche LC vers Tanger Ville). Le rapport l'inclut dans la facture
+# globale LGV (~10 MDH/an) car les trains ELBORAQ y transitent en bout
+# de course. On la traite séparément, hors carte de voie.
+MOGHOGHA_SST = {
+    "name": "TANGER MOGHOGHA",
+    "secteur": "Tanger LC (hors LGV)",
+    "kva_souscrite": 4850,        # PS depuis mars 2024
+    "color": "#7f8c8d",
+}
+
+# ---------------------------------------------------------------------------
+# Régimes tarifaires ONEE / EEM (DH/kWh, sauf prime fixe en DH/kW/An).
+# Source : rapport reporting d'énergie LGV — déc. 2025, valeurs 2026.
+# ---------------------------------------------------------------------------
+
+TARIF_REGIMES = {
+    "Tarif Général ONEE (TG)": {
+        "hp": 1.13709, "hpl": 0.81134, "hc": 0.59425,
+        "prime_dh_kw_an": 411.75,
+        "note": "Tarif de référence ONEE (régime général).",
+    },
+    "Tarif Optionnel ONEE 225 kV (TCU)": {
+        "hp": 1.59067, "hpl": 0.76775, "hc": 0.53259,
+        "prime_dh_kw_an": 315.00,
+        "note": "Régime contractuel actuel des SST LGV — gain ≈19% vs TG.",
+    },
+    "Mix réel 2025 (83% EEM + 17% ONEE TO)": {
+        # Pondération : 0.83 × tarifs EEM 2025 + 0.17 × tarifs TO 225kV 2026
+        "hp": 0.83 * 0.83020 + 0.17 * 1.59067,    # ≈ 0.9594
+        "hpl": 0.83 * 0.57233 + 0.17 * 0.76775,   # ≈ 0.6056
+        "hc": 0.83 * 0.40252 + 0.17 * 0.53259,    # ≈ 0.4246
+        "prime_dh_kw_an": 315.00,
+        "note": "Réalité observée sur la LGV en 2025 — 83% éolien EEM.",
+    },
+}
+
+# Répartition de l'énergie consommée 2025 (rapport §6) :
+# HP 23% · HPL 60% · HC 16% (le 1% restant = pertes/arrondi).
+DEFAULT_HOURLY_SHARE = {"hp": 0.23, "hpl": 0.61, "hc": 0.16}
 
 # ---------------------------------------------------------------------------
 # Profils de vitesse / puissance (rapport EPGV §VII.2, en vigueur 15/07/2022)
@@ -679,38 +720,87 @@ with st.sidebar:
     delay_b = st.slider("Retard signalé (min)", -5.0, 15.0, 0.0, 0.5, key="del_b")
 
     st.markdown("---")
-    st.markdown("### ⚡ Puissances souscrites (PS)")
-    st.caption("Ajustables si la souscription est révisée auprès de l'ONEE.")
-    ps_aouama = st.number_input(
-        "AOUAMA SST1 — Secteur Nord (KVA)",
-        min_value=1000, max_value=40000,
-        value=12000, step=500, key="ps_aouama",
-    )
-    ps_oulad = st.number_input(
-        "OULAD SLAMA SST2 — Secteur Sud (KVA)",
-        min_value=1000, max_value=40000,
-        value=14500, step=500, key="ps_oulad",
-    )
+    with st.expander("⚡ Puissances souscrites (PS)", expanded=True):
+        st.caption("Valeurs par défaut : plan hiver 2026 (rapport ONCF 12/2025).")
+        ps_aouama = st.number_input(
+            "AOUAMA SST1 — Secteur Nord (kW)",
+            min_value=1000, max_value=40000,
+            value=12500, step=500, key="ps_aouama",
+        )
+        ps_oulad = st.number_input(
+            "OULED SLAMA SST2 — Secteur Sud (kW)",
+            min_value=1000, max_value=40000,
+            value=16000, step=500, key="ps_oulad",
+        )
+        ps_moghogha = st.number_input(
+            "TANGER MOGHOGHA — Tanger LC (kW)",
+            min_value=500, max_value=15000,
+            value=4850, step=50, key="ps_moghogha",
+            help="Sous-station hors LGV (LC Tanger) — incluse "
+                 "dans la facturation globale ONCF.",
+        )
 
-    st.markdown("---")
-    st.markdown("### 💰 Paramètres économiques")
-    tarif_kwh = st.number_input(
-        "Tarif énergie (MAD/kWh)",
-        min_value=0.10, max_value=5.00,
-        value=1.05, step=0.05, format="%.2f",
-        help="Tarif HT moyen ONEE (≈ 1,05 MAD/kWh).",
-    )
-    trains_per_day = st.number_input(
-        "Circulations / jour / sens",
-        min_value=1, max_value=50, value=8, step=1,
-        help="Nombre d'Al Boraq Pair (T→K) ou Impair (K→T) par jour.",
-    )
-    penalite_kva = st.number_input(
-        "Pénalité dépassement PS (MAD/KVA/mois)",
-        min_value=0, max_value=500, value=50, step=5,
-        help="Coût mensuel facturé par l'ONEE pour chaque KVA "
-             "excédant la puissance souscrite.",
-    )
+    with st.expander("💰 Régime tarifaire", expanded=True):
+        tarif_mode = st.selectbox(
+            "Mode de tarification",
+            list(TARIF_REGIMES.keys()),
+            index=2,  # Mix réel 2025 par défaut
+            help="TG = Tarif Général · TCU = Tarif Optionnel "
+                 "(en vigueur sur la LGV) · Mix = réalité 2025.",
+        )
+        regime = TARIF_REGIMES[tarif_mode]
+        st.caption(regime["note"])
+
+        # Répartition horaire
+        share_hp = st.slider("Part Heures de pointe (%)", 0, 100,
+                             int(DEFAULT_HOURLY_SHARE["hp"] * 100), 1) / 100
+        share_hpl = st.slider("Part Heures pleines (%)", 0, 100,
+                              int(DEFAULT_HOURLY_SHARE["hpl"] * 100), 1) / 100
+        share_hc = st.slider("Part Heures creuses (%)", 0, 100,
+                             int(DEFAULT_HOURLY_SHARE["hc"] * 100), 1) / 100
+
+        avg_tarif = (regime["hp"] * share_hp
+                     + regime["hpl"] * share_hpl
+                     + regime["hc"] * share_hc)
+
+        st.markdown(
+            f"""
+<div style="background:#fff;border:1px solid #e1e5ea;border-radius:6px;
+            padding:8px 10px;margin-top:6px;font-size:12px;color:#2c3e50;">
+  <b>Tarifs appliqués (DH/kWh) :</b><br>
+  HP {regime['hp']:.4f} · HPL {regime['hpl']:.4f} · HC {regime['hc']:.4f}<br>
+  <b style="color:#1a5276">Tarif moyen pondéré : {avg_tarif:.4f} DH/kWh</b><br>
+  Prime fixe : {regime['prime_dh_kw_an']:.0f} DH/kW/An
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+
+        custom_tarif = st.toggle("✏️ Personnaliser le tarif moyen", value=False)
+        if custom_tarif:
+            tarif_kwh = st.number_input(
+                "Tarif moyen (DH/kWh)",
+                min_value=0.10, max_value=5.00,
+                value=float(round(avg_tarif, 4)),
+                step=0.01, format="%.4f",
+            )
+        else:
+            tarif_kwh = avg_tarif
+
+        prime_fixe = regime["prime_dh_kw_an"]
+
+    with st.expander("📊 Exploitation & pénalités", expanded=False):
+        trains_per_day = st.number_input(
+            "Circulations / jour / sens",
+            min_value=1, max_value=50, value=15, step=1,
+            help="≈ 30 trains/jour total sur la LGV en 2025 (rapport §7).",
+        )
+        penalite_kva = st.number_input(
+            "Pénalité dépassement PS (DH/kW/mois)",
+            min_value=0, max_value=500, value=50, step=5,
+            help="≈ 1,5 × prime fixe mensuelle. Pénalités totales LGV "
+                 "2025 = 1,22 MDH (rapport §9).",
+        )
 
     st.markdown("---")
     st.markdown("### ▶️ Lecture")
@@ -724,6 +814,7 @@ with st.sidebar:
 # ---------- Application des PS saisies ----------
 SUBSTATIONS[0]["kva_souscrite"] = int(ps_aouama)
 SUBSTATIONS[1]["kva_souscrite"] = int(ps_oulad)
+MOGHOGHA_SST["kva_souscrite"] = int(ps_moghogha)
 
 # ---------- Construction des trains ----------
 dep_a_dt = datetime.combine(today.date(), dep_a)
@@ -839,7 +930,7 @@ with tab1:
     st.markdown("---")
     st.markdown("### ⚡ Charge des sous-stations — instant courant")
     loads = substation_load([train_a, train_b], now)
-    cols = st.columns(len(SUBSTATIONS))
+    cols = st.columns(len(SUBSTATIONS) + 1)  # +1 pour MOGHOGHA (info)
     for col, sst in zip(cols, SUBSTATIONS):
         info = loads[sst["name"]]
         kva = kw_to_kva(info["kw"])
@@ -907,6 +998,34 @@ with tab1:
                     "Aucun train dans ce secteur</div>",
                     unsafe_allow_html=True,
                 )
+
+    # 3ᵉ colonne : MOGHOGHA (hors LGV — référence)
+    with cols[-1]:
+        m_ps = MOGHOGHA_SST["kva_souscrite"]
+        m_color = MOGHOGHA_SST["color"]
+        st.markdown(
+            f"""
+<div style="background:#fafbfc;border:1px dashed #bdc3c7;
+            border-left:6px solid {m_color};border-radius:10px;
+            padding:14px 18px;">
+  <div style="font-size:13px;color:#7f8c8d;letter-spacing:0.5px;text-transform:uppercase;">
+    {MOGHOGHA_SST['secteur']}
+  </div>
+  <div style="font-size:17px;font-weight:700;color:{m_color};margin-bottom:8px;">
+    {MOGHOGHA_SST['name']}
+  </div>
+  <div style="font-size:28px;font-weight:800;color:#2c3e50;line-height:1.1;">
+    PS {m_ps:,}
+    <span style="font-size:13px;color:#7f8c8d;font-weight:600;">kW</span>
+  </div>
+  <div style="font-size:12px;color:#7f8c8d;font-style:italic;margin-top:6px;">
+    Hors LGV — non chargée par les croisements Tanger ↔ Kenitra.
+    Référence pour la facture globale ONCF.
+  </div>
+</div>
+""".replace(",", " "),
+            unsafe_allow_html=True,
+        )
 
     # Bandeau de risque
     st.markdown(" ")
@@ -1039,21 +1158,62 @@ with tab4:
 
     # ----- Section 2 : agrégation journalière / mensuelle / annuelle -----
     st.markdown("### 📆 Coût d'exploitation extrapolé")
+    st.caption(
+        f"Régime tarifaire : **{tarif_mode}** · "
+        f"tarif moyen pondéré **{tarif_kwh:.4f} DH/kWh** · "
+        f"prime fixe **{prime_fixe:.0f} DH/kW/An**."
+    )
+
+    # Énergie : un trajet = un sens. trains_per_day est par sens, donc
+    # le total quotidien = (E(A) + E(B)) × trains_per_day.
     daily_kwh = sum(train_energy_kwh(tr) for tr in [train_a, train_b]) * trains_per_day
-    daily_cost = daily_kwh * tarif_kwh
-    monthly_cost = daily_cost * 30
-    yearly_cost = daily_cost * 365
+    daily_energy_cost = daily_kwh * tarif_kwh
+
+    # Prime fixe annuelle = somme(PS) × prime_dh_kw_an
+    total_ps_kw = ps_aouama + ps_oulad + ps_moghogha
+    yearly_prime = total_ps_kw * prime_fixe
+    monthly_prime = yearly_prime / 12
+
+    daily_total = daily_energy_cost + monthly_prime / 30
+    monthly_total = daily_energy_cost * 30 + monthly_prime
+    yearly_total = daily_energy_cost * 365 + yearly_prime
 
     cc1, cc2, cc3, cc4 = st.columns(4)
     cc1.metric("⚡ Énergie / jour",
                f"{daily_kwh:,.0f} kWh".replace(",", " "),
-               help=f"({trains_per_day} circulations × 2 sens).")
+               help=f"{trains_per_day} circulations × 2 sens × "
+                    "consommation par train.")
     cc2.metric("💵 Coût énergie / jour",
-               f"{daily_cost:,.0f} MAD".replace(",", " "))
-    cc3.metric("📅 Coût / mois",
-               f"{monthly_cost:,.0f} MAD".replace(",", " "))
-    cc4.metric("🗓️ Coût / an",
-               f"{yearly_cost:,.0f} MAD".replace(",", " "))
+               f"{daily_energy_cost:,.0f} DH".replace(",", " "),
+               help="Énergie × tarif moyen pondéré.")
+    cc3.metric("🏛️ Prime fixe / mois",
+               f"{monthly_prime:,.0f} DH".replace(",", " "),
+               help=f"({total_ps_kw:,} kW × {prime_fixe:.0f} DH/kW/An ÷ 12)"
+               .replace(",", " "))
+    cc4.metric("🗓️ Coût total / an",
+               f"{yearly_total/1e6:.2f} MDH",
+               help=f"≈ {yearly_total:,.0f} DH".replace(",", " "))
+
+    # Référence ONCF 2025
+    st.markdown(
+        """
+<div style="background:#f4f6f7;border-left:4px solid #1a5276;
+            border-radius:6px;padding:12px 16px;margin-top:8px;
+            font-size:13px;color:#2c3e50;">
+  <b>📌 Référence ONCF — Reporting d'énergie LGV déc. 2025</b><br>
+  • Facture annuelle 2025 (LGV + MOGHOGHA) : <b>48,88 MDH HT</b><br>
+  • Énergie consommée 2025 : <b>48,9 GWh</b> (83% éolien EEM, 17% ONEE)<br>
+  • Coût moyen / train US sur LGV : <b>3 505 DH</b>
+    (4 431 DH avec MOGHOGHA)<br>
+  • Conso moyenne / train US : <b>1 623 kWh</b> (sud)
+    + <b>1 801 kWh</b> (nord) = <b>3 424 kWh</b> aller simple<br>
+  • Trains commerciaux 2025 : <b>10 301</b> US + <b>1 487</b> UM<br>
+  • Pénalités dépassement 2025 : <b>1,22 MDH</b> (LGV)
+    + 0,15 MDH (MOGHOGHA)
+</div>
+""",
+        unsafe_allow_html=True,
+    )
 
     # ----- Section 3 : profil de risque le long de la ligne --------------
     st.markdown("### 📈 Profil de pic combiné — où coûte un croisement ?")

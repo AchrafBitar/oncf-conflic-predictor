@@ -6,3 +6,8 @@ venv/
 .streamlit/secrets.toml
 .DS_Store
 .claude/
+
+# Documents internes ONCF — ne pas pousser sur GitHub
+*.pdf
+*.docx
+*.xlsx
