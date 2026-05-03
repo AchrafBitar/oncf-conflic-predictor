@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -258,6 +258,72 @@ def substation_load(trains, t):
 
 def kw_to_kva(kw, pf=0.95):
     return int(round(kw / pf)) if pf > 0 else kw
+
+
+# ---------------------------------------------------------------------------
+# Énergie & analyse économique
+# ---------------------------------------------------------------------------
+
+def train_energy_kwh(train: Train) -> float:
+    """Énergie absorbée par le train sur un trajet complet (kWh)."""
+    total = 0.0
+    for pk_a, pk_b, phase in train.profile():
+        seg_h = abs(pk_b - pk_a) / PHASE_SPEED_KMH[phase]
+        total += PHASE_POWER_KW_PER_RAME[phase] * train.n_rames * seg_h
+    return total
+
+
+def phase_at_pk(train: Train, pk: float):
+    """Phase du train quand sa tête se trouve au PK indiqué."""
+    for pk_a, pk_b, phase in train.profile():
+        lo, hi = min(pk_a, pk_b), max(pk_a, pk_b)
+        if lo - 1e-6 <= pk <= hi + 1e-6:
+            return phase
+    return None
+
+
+def crossing_power_profile(a: Train, b: Train, step_km=1.0):
+    """
+    Pour chaque PK candidat, donne l'appel combiné en KVA si les deux
+    rames se rencontraient à ce point. Permet de visualiser les zones
+    « chères » de la ligne.
+    """
+    pks, kvas = [], []
+    pk = 0.0
+    while pk <= LGV_LENGTH_KM + 1e-6:
+        pa = phase_at_pk(a, pk)
+        pb = phase_at_pk(b, pk)
+        if pa is not None and pb is not None:
+            kw = (PHASE_POWER_KW_PER_RAME[pa] * a.n_rames
+                  + PHASE_POWER_KW_PER_RAME[pb] * b.n_rames)
+            pks.append(pk)
+            kvas.append(kw_to_kva(kw))
+        pk += step_km
+    return pks, kvas
+
+
+def scan_optimal_delay(a: Train, b: Train,
+                       extra_range=(-5.0, 10.0), step=0.5):
+    """
+    Balaye un retard supplémentaire appliqué au train Pair pour trouver
+    celui qui minimise l'appel combiné au croisement.
+    """
+    candidates = []
+    d = extra_range[0]
+    while d <= extra_range[1] + 1e-9:
+        a_try = replace(a, delay_min=a.delay_min + d)
+        res = find_meeting(a_try, b, "optimiste")
+        if res is not None:
+            pk, when, pa_phase, pb_phase = res
+            kw = (PHASE_POWER_KW_PER_RAME[pa_phase] * a.n_rames
+                  + PHASE_POWER_KW_PER_RAME[pb_phase] * b.n_rames)
+            candidates.append({
+                "delay": round(d, 2), "pk": pk, "when": when,
+                "phase_a": pa_phase, "phase_b": pb_phase,
+                "kw": kw, "kva": kw_to_kva(kw),
+            })
+        d += step
+    return candidates
 
 
 # ---------------------------------------------------------------------------
@@ -627,6 +693,26 @@ with st.sidebar:
     )
 
     st.markdown("---")
+    st.markdown("### 💰 Paramètres économiques")
+    tarif_kwh = st.number_input(
+        "Tarif énergie (MAD/kWh)",
+        min_value=0.10, max_value=5.00,
+        value=1.05, step=0.05, format="%.2f",
+        help="Tarif HT moyen ONEE (≈ 1,05 MAD/kWh).",
+    )
+    trains_per_day = st.number_input(
+        "Circulations / jour / sens",
+        min_value=1, max_value=50, value=8, step=1,
+        help="Nombre d'Al Boraq Pair (T→K) ou Impair (K→T) par jour.",
+    )
+    penalite_kva = st.number_input(
+        "Pénalité dépassement PS (MAD/KVA/mois)",
+        min_value=0, max_value=500, value=50, step=5,
+        help="Coût mensuel facturé par l'ONEE pour chaque KVA "
+             "excédant la puissance souscrite.",
+    )
+
+    st.markdown("---")
     st.markdown("### ▶️ Lecture")
     sim_speed = st.slider("Vitesse simulation (× réel)", 1, 240, 60)
     run_sim = st.toggle("Lancer la simulation", value=False)
@@ -707,10 +793,11 @@ with k4:
 st.markdown(" ")
 
 # ---------- Onglets principaux ----------
-tab1, tab2, tab3 = st.tabs([
+tab1, tab2, tab3, tab4 = st.tabs([
     "🗺️ Carte de la voie",
     "📉 Marche graphique",
     "📊 Détails & scénarios",
+    "💰 Économie & gains",
 ])
 
 with tab1:
@@ -923,6 +1010,300 @@ with tab3:
 **Incident référencé** : pic de **17 490 KVA** sur OULAD SLAMA les 08–09/07/2022
 lors de croisements UM × US, à l'origine du nouveau plan d'éco-conduite.
 """)
+
+with tab4:
+    st.markdown("## 💰 Analyse économique & optimisation des croisements")
+    st.markdown(
+        "Cet onglet quantifie le **gain en MAD** apporté par l'outil. "
+        "Le levier est simple : décaler légèrement le départ d'un train "
+        "pour déplacer le point de croisement vers une zone où les deux "
+        "rames consomment peu, ce qui évite les pénalités de dépassement "
+        "de la puissance souscrite (PS)."
+    )
+
+    # ----- Section 1 : énergie & coût par train --------------------------
+    st.markdown("### 🔋 Consommation par train sur un trajet complet")
+    rows = []
+    for tr in [train_a, train_b]:
+        e_kwh = train_energy_kwh(tr)
+        c_mad = e_kwh * tarif_kwh
+        rows.append({
+            "Train": tr.name,
+            "Sens": tr.sens_label,
+            "Composition": f"{tr.composition} ({tr.n_rames} rame{'s' if tr.n_rames>1 else ''})",
+            "Profil": tr.profile_name,
+            "Énergie (kWh)": f"{e_kwh:,.0f}".replace(",", " "),
+            "Coût (MAD)":   f"{c_mad:,.0f}".replace(",", " "),
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # ----- Section 2 : agrégation journalière / mensuelle / annuelle -----
+    st.markdown("### 📆 Coût d'exploitation extrapolé")
+    daily_kwh = sum(train_energy_kwh(tr) for tr in [train_a, train_b]) * trains_per_day
+    daily_cost = daily_kwh * tarif_kwh
+    monthly_cost = daily_cost * 30
+    yearly_cost = daily_cost * 365
+
+    cc1, cc2, cc3, cc4 = st.columns(4)
+    cc1.metric("⚡ Énergie / jour",
+               f"{daily_kwh:,.0f} kWh".replace(",", " "),
+               help=f"({trains_per_day} circulations × 2 sens).")
+    cc2.metric("💵 Coût énergie / jour",
+               f"{daily_cost:,.0f} MAD".replace(",", " "))
+    cc3.metric("📅 Coût / mois",
+               f"{monthly_cost:,.0f} MAD".replace(",", " "))
+    cc4.metric("🗓️ Coût / an",
+               f"{yearly_cost:,.0f} MAD".replace(",", " "))
+
+    # ----- Section 3 : profil de risque le long de la ligne --------------
+    st.markdown("### 📈 Profil de pic combiné — où coûte un croisement ?")
+    st.caption(
+        "Pour chaque PK candidat, le graphique montre l'appel combiné "
+        "des deux trains s'ils s'y rencontraient. Les barres rouges "
+        "dépassent la PS du secteur — c'est là que vous payez des pénalités."
+    )
+
+    pks_p, kvas_p = crossing_power_profile(train_a, train_b, step_km=1.0)
+    if pks_p:
+        bar_colors = []
+        for pk_v, kva_v in zip(pks_p, kvas_p):
+            sst = substation_for(pk_v)
+            limit = sst["kva_souscrite"] if sst else 14500
+            if kva_v > limit:
+                bar_colors.append("#c0392b")
+            elif kva_v > 0.85 * limit:
+                bar_colors.append("#f39c12")
+            else:
+                bar_colors.append("#27ae60")
+
+        fig_prof = go.Figure()
+        y_max = max(kvas_p) * 1.15
+
+        for sst in SUBSTATIONS:
+            fig_prof.add_shape(
+                type="rect",
+                x0=sst["pk_start"], x1=sst["pk_end"],
+                y0=0, y1=y_max,
+                fillcolor=sst["fill"], line_width=0, layer="below",
+            )
+            # Ligne PS du secteur
+            fig_prof.add_shape(
+                type="line",
+                x0=sst["pk_start"], x1=sst["pk_end"],
+                y0=sst["kva_souscrite"], y1=sst["kva_souscrite"],
+                line=dict(color=sst["color"], dash="dash", width=2),
+            )
+            ps_lbl = f"{sst['kva_souscrite']:,}".replace(",", " ")
+            fig_prof.add_annotation(
+                x=(sst["pk_start"] + sst["pk_end"]) / 2,
+                y=sst["kva_souscrite"],
+                text=f"<b>PS {sst['name']}</b> · {ps_lbl} KVA",
+                showarrow=False, yshift=12,
+                font=dict(color=sst["color"], size=11),
+                bgcolor="rgba(255,255,255,0.95)",
+                bordercolor=sst["color"], borderwidth=1, borderpad=3,
+            )
+
+        fig_prof.add_trace(go.Bar(
+            x=pks_p, y=kvas_p, marker=dict(color=bar_colors),
+            hovertemplate="PK %{x:.0f}<br><b>%{y:,.0f} KVA</b><extra></extra>",
+            showlegend=False,
+        ))
+
+        # Marqueur du croisement actuel
+        if meeting_main is not None:
+            fig_prof.add_shape(
+                type="line",
+                x0=meeting_main, x1=meeting_main,
+                y0=0, y1=y_max,
+                line=dict(color="#2c3e50", dash="dot", width=2),
+            )
+            fig_prof.add_annotation(
+                x=meeting_main, y=y_max * 0.95,
+                text=f"<b>Croisement actuel</b><br>PK {meeting_main:.1f}",
+                showarrow=False,
+                font=dict(size=11, color="#2c3e50"),
+                bgcolor="rgba(255,255,255,0.95)",
+                bordercolor="#2c3e50", borderwidth=1, borderpad=3,
+            )
+
+        fig_prof.update_xaxes(
+            title=dict(text="<b>PK candidat (km)</b>", font=dict(size=13)),
+            range=[0, LGV_LENGTH_KM], dtick=20,
+        )
+        fig_prof.update_yaxes(
+            title=dict(text="<b>Pic combiné (KVA)</b>", font=dict(size=13)),
+            range=[0, y_max],
+        )
+        fig_prof.update_layout(
+            height=380, margin=dict(l=20, r=20, t=20, b=40),
+            plot_bgcolor="#ffffff", paper_bgcolor="white",
+        )
+        st.plotly_chart(fig_prof, use_container_width=True)
+
+    # ----- Section 4 : optimisation par retard ---------------------------
+    st.markdown("### 🎯 Optimiseur — retard à appliquer pour économiser")
+
+    if meeting_main is None:
+        st.info("Pas de croisement détecté avec les paramètres actuels.")
+    else:
+        cands = scan_optimal_delay(train_a, train_b)
+        if not cands:
+            st.info("Aucune solution dans la plage de scan (-5 à +10 min).")
+        else:
+            base = min(cands, key=lambda c: abs(c["delay"]))
+            best = min(cands, key=lambda c: c["kva"])
+
+            sst_b = substation_for(base["pk"])
+            sst_o = substation_for(best["pk"])
+            ps_b = sst_b["kva_souscrite"] if sst_b else 14500
+            ps_o = sst_o["kva_souscrite"] if sst_o else 14500
+            dep_b = max(0, base["kva"] - ps_b)
+            dep_o = max(0, best["kva"] - ps_o)
+            kva_evite = dep_b - dep_o
+
+            cb, co = st.columns(2)
+            with cb:
+                st.markdown(
+                    f"""
+<div style="border:1px solid #f5b7b1;background:#fdedec;border-radius:10px;padding:14px;">
+  <div style="color:#c0392b;font-weight:700;margin-bottom:6px;">🔴 Sans optimisation</div>
+  <div style="color:#2c3e50;font-size:14px;line-height:1.7;">
+    PK croisement : <b>{base['pk']:.1f}</b><br>
+    Phases : {PHASE_LABELS_FR[base['phase_a']]} × {PHASE_LABELS_FR[base['phase_b']]}<br>
+    Secteur : <b>{sst_b['name'] if sst_b else '—'}</b> (PS {ps_b:,} KVA)<br>
+    Pic combiné : <b style="color:#c0392b;font-size:18px;">{base['kva']:,} KVA</b><br>
+    Dépassement : <b>{dep_b:,} KVA</b>
+  </div>
+</div>
+""".replace(",", " "),
+                    unsafe_allow_html=True,
+                )
+            with co:
+                st.markdown(
+                    f"""
+<div style="border:1px solid #abebc6;background:#eafaf1;border-radius:10px;padding:14px;">
+  <div style="color:#27ae60;font-weight:700;margin-bottom:6px;">🟢 Avec retard optimal</div>
+  <div style="color:#2c3e50;font-size:14px;line-height:1.7;">
+    Retard appliqué Pair : <b>{best['delay']:+.1f} min</b><br>
+    PK croisement : <b>{best['pk']:.1f}</b><br>
+    Phases : {PHASE_LABELS_FR[best['phase_a']]} × {PHASE_LABELS_FR[best['phase_b']]}<br>
+    Secteur : <b>{sst_o['name'] if sst_o else '—'}</b> (PS {ps_o:,} KVA)<br>
+    Pic combiné : <b style="color:#27ae60;font-size:18px;">{best['kva']:,} KVA</b><br>
+    Dépassement : <b>{dep_o:,} KVA</b>
+  </div>
+</div>
+""".replace(",", " "),
+                    unsafe_allow_html=True,
+                )
+
+            # Estimation du gain en MAD
+            gain_par_evt = kva_evite * penalite_kva  # par mois si appliqué chaque jour
+            # Plus juste : pénalité = excédent × tarif × nb croisements concernés / mois
+            # On suppose 1 croisement / jour entre A et B (cas étudié), 30 j/mois.
+            gain_mois = kva_evite * penalite_kva  # MAD/mois pour cette paire
+            gain_an = gain_mois * 12
+
+            if kva_evite > 0:
+                st.markdown(
+                    f"""
+<div style="margin-top:14px;padding:18px;border-radius:10px;
+            background:linear-gradient(135deg,#27ae60 0%,#16a085 100%);
+            color:white;">
+  <div style="font-size:14px;opacity:0.9;">💰 Gain estimé pour cette paire</div>
+  <div style="font-size:32px;font-weight:800;line-height:1.2;margin:6px 0;">
+    ≈ {gain_mois:,.0f} MAD / mois
+  </div>
+  <div style="font-size:18px;opacity:0.95;">
+    soit <b>≈ {gain_an:,.0f} MAD / an</b>
+  </div>
+  <div style="font-size:13px;opacity:0.85;margin-top:8px;">
+    En retardant le Train Pair de {best['delay']:+.1f} min, on évite
+    <b>{kva_evite:,} KVA</b> de dépassement (pénalité {penalite_kva} MAD/KVA/mois).
+  </div>
+</div>
+""".replace(",", " "),
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.info(
+                    "✅ Le croisement actuel reste sous la PS du secteur — "
+                    "pas de pénalité à éviter sur cette paire."
+                )
+
+            # Courbe de scan
+            with st.expander("📊 Courbe de scan : pic combiné selon le retard"):
+                fig_scan = go.Figure()
+                fig_scan.add_trace(go.Scatter(
+                    x=[c["delay"] for c in cands],
+                    y=[c["kva"] for c in cands],
+                    mode="lines+markers",
+                    line=dict(color="#1a5276", width=3),
+                    marker=dict(size=7, color="#1a5276"),
+                    hovertemplate="Retard %{x:+.1f} min<br>"
+                                  "<b>%{y:,.0f} KVA</b><extra></extra>",
+                    name="Pic combiné",
+                ))
+                fig_scan.add_shape(
+                    type="line", x0=best["delay"], x1=best["delay"],
+                    y0=0, y1=max(c["kva"] for c in cands) * 1.05,
+                    line=dict(color="#27ae60", dash="dash", width=2),
+                )
+                fig_scan.add_annotation(
+                    x=best["delay"], y=best["kva"],
+                    text=f"<b>Optimum</b><br>{best['delay']:+.1f} min",
+                    showarrow=True, arrowhead=2, ax=30, ay=-40,
+                    font=dict(color="#27ae60"),
+                    bgcolor="rgba(255,255,255,0.95)",
+                    bordercolor="#27ae60", borderwidth=1, borderpad=3,
+                )
+                # Ligne PS de référence (secteur du croisement actuel)
+                ref_ps = ps_b
+                fig_scan.add_hline(
+                    y=ref_ps,
+                    line=dict(color="#c0392b", dash="dot", width=2),
+                    annotation_text=f"PS {ref_ps:,} KVA".replace(",", " "),
+                    annotation_position="top right",
+                    annotation_font_color="#c0392b",
+                )
+                fig_scan.update_xaxes(
+                    title="<b>Retard supplémentaire Train Pair (min)</b>",
+                )
+                fig_scan.update_yaxes(
+                    title="<b>Pic combiné au croisement (KVA)</b>",
+                )
+                fig_scan.update_layout(
+                    height=320,
+                    margin=dict(l=20, r=20, t=20, b=40),
+                    plot_bgcolor="#ffffff", paper_bgcolor="white",
+                )
+                st.plotly_chart(fig_scan, use_container_width=True)
+
+    with st.expander("ℹ️ Méthode de calcul du gain"):
+        st.markdown("""
+**Énergie par train** : intégration de la puissance par phase
+× durée de phase ; durée = longueur du segment / vitesse de phase.
+
+**Profil de pic combiné** : pour chaque PK candidat de croisement, on
+suppose que les deux rames y sont simultanément et on additionne leur
+puissance instantanée selon leurs phases respectives à ce PK. Le résultat
+est converti en KVA (`kw / cosφ`, cosφ ≈ 0,95).
+
+**Optimisation** : balayage de retards supplémentaires sur le Train Pair
+de −5 à +10 min (pas 30 s). Pour chaque retard, on recalcule le PK et
+l'instant du croisement, puis le pic combiné. On retient le retard qui
+minimise ce pic.
+
+**Gain MAD** : la différence de dépassement de PS entre la situation
+nominale et la situation optimisée, multipliée par le tarif de pénalité
+(MAD/KVA/mois) — extrapolée sur 12 mois.
+
+> ⚠ *Hypothèse simplificatrice :* la pénalité ONEE réelle dépend du
+> contrat (PMD, prime fixe, surfacturation des dépassements). Le chiffre
+> affiché reste un ordre de grandeur — à recaler avec le contrat exact
+> avant chiffrage final.
+""")
+
 
 if run_sim:
     time.sleep(1.0)
