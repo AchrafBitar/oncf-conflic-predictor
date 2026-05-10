@@ -1316,60 +1316,139 @@ with tab4:
         })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-    # ----- Section 2 : agrégation journalière / mensuelle / annuelle -----
-    st.markdown("### 📆 Coût d'exploitation extrapolé")
+    # ----- Section 2 : facture annuelle décomposée ------------------------
+    st.markdown("### 📆 Facture annuelle nominale (décomposée)")
     st.caption(
         f"Régime tarifaire : **{tarif_mode}** · "
         f"tarif moyen pondéré **{tarif_kwh:.4f} DH/kWh** · "
-        f"prime fixe **{prime_fixe:.0f} DH/kW/An**."
+        f"prime fixe **{prime_fixe:.0f} DH/{regime['type'].replace('TG','kVA').replace('TCU','kW')}/An**. "
+        "Toutes les formules suivent le *Cours TECH SS* (LAGHRIBI Otmane, ONCF/DMI/SMCSSE)."
     )
 
-    # Énergie : un trajet = un sens. trains_per_day est par sens, donc
-    # le total quotidien = (E(A) + E(B)) × trains_per_day.
-    daily_kwh = sum(train_energy_kwh(tr) for tr in [train_a, train_b]) * trains_per_day
+    # ---------- (i) Énergie -----------------------------------------------
+    # daily_kwh = (E_A + E_B) × trains_per_day, où trains_per_day est /sens.
+    # train_energy_kwh() prend déjà en compte n_rames (UM = 2× US),
+    # donc on n'applique pas de pondération supplémentaire ici.
+    e_train_a = train_energy_kwh(train_a)
+    e_train_b = train_energy_kwh(train_b)
+    daily_kwh = (e_train_a + e_train_b) * trains_per_day
     daily_energy_cost = daily_kwh * tarif_kwh
+    yearly_energy = daily_energy_cost * 365
 
-    # Prime fixe annuelle = somme(PS) × prime_dh_kw_an
-    total_ps_kw = ps_aouama + ps_oulad + ps_moghogha
-    yearly_prime = total_ps_kw * prime_fixe
-    monthly_prime = yearly_prime / 12
+    # Référence reporting 2025 pour calibration : 48,9 GWh consommés sur
+    # 10 301 US + 1 487 UM → l'utilisateur peut ajuster trains_per_day,
+    # composition (US/UM) et profil (Éco/Normale) pour s'en approcher.
 
-    daily_total = daily_energy_cost + monthly_prime / 30
-    monthly_total = daily_energy_cost * 30 + monthly_prime
-    yearly_total = daily_energy_cost * 365 + yearly_prime
+    # ---------- (ii) RPS LGV (sur PS1 — équivalent kW HP) -----------------
+    # Pour les deux SST LGV (AOUAMA + OULED SLAMA). Cours TECH SS §VI.3.2 :
+    # RPS = Pf/12 × PS1, donc RPS annuelle = Pf × PS1 par SST.
+    rps_aouama_an = ps_aouama * prime_fixe
+    rps_oulad_an = ps_oulad * prime_fixe
+    rps_lgv_an = rps_aouama_an + rps_oulad_an
 
+    # ---------- (iii) RDPS référence (Reporting 2025) ---------------------
+    # 1,22 MDH/an pour la LGV — base réelle ; sera réduite par l'optimiseur.
+    RDPS_LGV_REF_2025 = 1_220_000.0
+    RDPS_MOGHOGHA_REF_2025 = 150_000.0
+
+    # ---------- (iv) Bloc Moghogha (hors LGV, optionnel) -------------------
+    inclure_moghogha = st.toggle(
+        "Inclure TANGER MOGHOGHA dans le total (hors LGV)",
+        value=True,
+        help="Moghogha alimente l'approche LC de Tanger ; bien que hors "
+             "LGV, elle est intégrée à la facture globale ONCF.",
+    )
+    rps_moghogha_an = ps_moghogha * prime_fixe
+    # Moghogha consomme ~5 % de l'énergie totale (estimé à partir de
+    # l'écart 4431-3505 = 926 DH/train ≈ 1/4 de coût LGV).
+    energy_moghogha_an = yearly_energy * 0.20      # ≈ 20 % de l'énergie
+    rdps_moghogha_an = RDPS_MOGHOGHA_REF_2025 if inclure_moghogha else 0.0
+    moghogha_total = (rps_moghogha_an + energy_moghogha_an + rdps_moghogha_an
+                      ) if inclure_moghogha else 0.0
+
+    # ---------- (v) Total LGV + Moghogha ----------------------------------
+    energy_lgv_an = yearly_energy * (0.80 if inclure_moghogha else 1.0)
+    lgv_total = energy_lgv_an + rps_lgv_an + RDPS_LGV_REF_2025
+    yearly_total = lgv_total + moghogha_total
+
+    # ---------- (vi) Affichage : 4 KPI ------------------------------------
     cc1, cc2, cc3, cc4 = st.columns(4)
-    cc1.metric("⚡ Énergie / jour",
-               f"{daily_kwh:,.0f} kWh".replace(",", " "),
-               help=f"{trains_per_day} circulations × 2 sens × "
-                    "consommation par train.")
-    cc2.metric("💵 Coût énergie / jour",
-               f"{daily_energy_cost:,.0f} DH".replace(",", " "),
-               help="Énergie × tarif moyen pondéré.")
-    cc3.metric("🏛️ Prime fixe / mois",
-               f"{monthly_prime:,.0f} DH".replace(",", " "),
-               help=f"({total_ps_kw:,} kW × {prime_fixe:.0f} DH/kW/An ÷ 12)"
-               .replace(",", " "))
+    cc1.metric("⚡ Énergie / an",
+               f"{(energy_lgv_an + (energy_moghogha_an if inclure_moghogha else 0))/1e6:.2f} MDH",
+               help=f"{daily_kwh:,.0f} kWh/jour × 365 × {tarif_kwh:.3f} DH/kWh"
+                    f" — sur la base de Train A ({comp_a} {prof_a}) "
+                    f"et Train B ({comp_b} {prof_b})".replace(",", " "))
+    cc2.metric("🏛️ RPS LGV / an",
+               f"{rps_lgv_an/1e6:.2f} MDH",
+               help=f"(PS₁ AOUAMA {ps_aouama:,} + PS₁ OULED {ps_oulad:,}) × "
+                    f"{prime_fixe:.0f} DH/kW/An".replace(",", " "))
+    cc3.metric("⚠️ RDPS LGV (réf. 2025)",
+               f"{RDPS_LGV_REF_2025/1e6:.2f} MDH",
+               help="Pénalités de dépassement LGV constatées en 2025 — "
+                    "à réduire par éco-conduite et régulation du graphique.")
     cc4.metric("🗓️ Coût total / an",
                f"{yearly_total/1e6:.2f} MDH",
-               help=f"≈ {yearly_total:,.0f} DH".replace(",", " "))
+               delta=f"{(yearly_total - 48_880_000)/1e6:+.2f} MDH vs réel 2025",
+               delta_color="inverse",
+               help=f"Énergie + RPS + RDPS LGV"
+                    f"{' + Moghogha' if inclure_moghogha else ''}.")
 
-    # Référence ONCF 2025
+    # ---------- (vii) Tableau de décomposition détaillée ------------------
+    decomp = pd.DataFrame([
+        {"Poste": "🔋 Énergie LGV (AOUAMA + OULED SLAMA)",
+         "Annuel (DH)": f"{energy_lgv_an:,.0f}".replace(",", " "),
+         "% facture": f"{energy_lgv_an / yearly_total * 100:.1f} %"},
+        {"Poste": "🏛️ RPS AOUAMA SST1 (PS₁ HP)",
+         "Annuel (DH)": f"{rps_aouama_an:,.0f}".replace(",", " "),
+         "% facture": f"{rps_aouama_an / yearly_total * 100:.1f} %"},
+        {"Poste": "🏛️ RPS OULED SLAMA SST2 (PS₁ HP)",
+         "Annuel (DH)": f"{rps_oulad_an:,.0f}".replace(",", " "),
+         "% facture": f"{rps_oulad_an / yearly_total * 100:.1f} %"},
+        {"Poste": "⚠️ RDPS LGV (référence Reporting 2025)",
+         "Annuel (DH)": f"{RDPS_LGV_REF_2025:,.0f}".replace(",", " "),
+         "% facture": f"{RDPS_LGV_REF_2025 / yearly_total * 100:.1f} %"},
+    ] + ([
+        {"Poste": "🔋 Énergie MOGHOGHA (LC Tanger)",
+         "Annuel (DH)": f"{energy_moghogha_an:,.0f}".replace(",", " "),
+         "% facture": f"{energy_moghogha_an / yearly_total * 100:.1f} %"},
+        {"Poste": "🏛️ RPS MOGHOGHA",
+         "Annuel (DH)": f"{rps_moghogha_an:,.0f}".replace(",", " "),
+         "% facture": f"{rps_moghogha_an / yearly_total * 100:.1f} %"},
+        {"Poste": "⚠️ RDPS MOGHOGHA (référence 2025)",
+         "Annuel (DH)": f"{rdps_moghogha_an:,.0f}".replace(",", " "),
+         "% facture": f"{rdps_moghogha_an / yearly_total * 100:.1f} %"},
+    ] if inclure_moghogha else []) + [
+        {"Poste": "💰 TOTAL HT",
+         "Annuel (DH)": f"{yearly_total:,.0f}".replace(",", " "),
+         "% facture": "100 %"},
+    ])
+    st.dataframe(decomp, use_container_width=True, hide_index=True)
+
+    # ---------- (viii) Calibration vs Reporting 2025 ----------------------
+    REEL_2025 = 48_880_000.0
+    ecart = yearly_total - REEL_2025
+    pct_ecart = ecart / REEL_2025 * 100
+    color = "#27ae60" if abs(pct_ecart) < 5 else "#f39c12" if abs(pct_ecart) < 15 else "#c0392b"
+
     st.markdown(
-        """
+        f"""
 <div style="background:#f4f6f7;border-left:4px solid #1a5276;
             border-radius:6px;padding:12px 16px;margin-top:8px;
             font-size:13px;color:#2c3e50;">
   <b>📌 Référence ONCF — Reporting d'énergie LGV déc. 2025</b><br>
   • Facture annuelle 2025 (LGV + MOGHOGHA) : <b>48,88 MDH HT</b><br>
-  • Énergie consommée 2025 : <b>48,9 GWh</b> (83% éolien EEM, 17% ONEE)<br>
+  • Énergie consommée 2025 : <b>48,9 GWh</b> (83 % éolien EEM, 17 % ONEE)<br>
   • Coût moyen / train US sur LGV : <b>3 505 DH</b>
     (4 431 DH avec MOGHOGHA)<br>
   • Conso moyenne / train US : <b>1 623 kWh</b> (sud)
     + <b>1 801 kWh</b> (nord) = <b>3 424 kWh</b> aller simple<br>
   • Trains commerciaux 2025 : <b>10 301</b> US + <b>1 487</b> UM<br>
   • Pénalités dépassement 2025 : <b>1,22 MDH</b> (LGV)
-    + 0,15 MDH (MOGHOGHA)
+    + 0,15 MDH (MOGHOGHA)<br>
+  <hr style='margin:6px 0;border:none;border-top:1px solid #d5dbdb;'>
+  <b>Calibration de la simulation actuelle :</b>
+  estimation <b>{yearly_total/1e6:.2f} MDH</b> · réel 2025 <b>48,88 MDH</b>
+  · écart <b style='color:{color}'>{ecart/1e6:+.2f} MDH ({pct_ecart:+.1f} %)</b>.
 </div>
 """,
         unsafe_allow_html=True,
