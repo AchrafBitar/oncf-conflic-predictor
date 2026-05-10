@@ -73,22 +73,32 @@ MOGHOGHA_SST = {
 }
 
 # ---------------------------------------------------------------------------
-# Régimes tarifaires ONEE / EEM (DH/kWh, sauf prime fixe en DH/kW/An).
-# Source : rapport reporting d'énergie LGV — déc. 2025, valeurs 2026.
+# Régimes tarifaires ONEE / EEM
+#
+# Source officielle des formules : Cours TECH SS, ONCF/PIC/DMI/SMCSSE
+#   (LAGHRIBI Otmane), §VI Consommations d'énergie : calculs et redevances.
+# Source des prix 2026 : Reporting d'énergie LGV — décembre 2025.
+#
+# Conventions :
+#   - "type" = "TG" (kVA, formule monobloc) ou "TCU" (kW, trois tranches PS1/PS2/PS3)
+#   - prime_dh_kw_an : prime fixe annuelle (DH/kVA/an pour TG, DH/kW/an pour TCU)
 # ---------------------------------------------------------------------------
 
 TARIF_REGIMES = {
     "Tarif Général ONEE (TG)": {
+        "type": "TG",
         "hp": 1.13709, "hpl": 0.81134, "hc": 0.59425,
-        "prime_dh_kw_an": 411.75,
-        "note": "Tarif de référence ONEE (régime général).",
+        "prime_dh_kw_an": 411.75,  # DH/kVA/an
+        "note": "Tarif de référence ONEE (régime général, kVA).",
     },
     "Tarif Optionnel ONEE 225 kV (TCU)": {
+        "type": "TCU",
         "hp": 1.59067, "hpl": 0.76775, "hc": 0.53259,
-        "prime_dh_kw_an": 315.00,
+        "prime_dh_kw_an": 315.00,  # DH/kW/an
         "note": "Régime contractuel actuel des SST LGV — gain ≈19% vs TG.",
     },
     "Mix réel 2025 (83% EEM + 17% ONEE TO)": {
+        "type": "TCU",
         # Pondération : 0.83 × tarifs EEM 2025 + 0.17 × tarifs TO 225kV 2026
         "hp": 0.83 * 0.83020 + 0.17 * 1.59067,    # ≈ 0.9594
         "hpl": 0.83 * 0.57233 + 0.17 * 0.76775,   # ≈ 0.6056
@@ -98,9 +108,145 @@ TARIF_REGIMES = {
     },
 }
 
-# Répartition de l'énergie consommée 2025 (rapport §6) :
-# HP 23% · HPL 60% · HC 16% (le 1% restant = pertes/arrondi).
+# Coefficient de transit ONEE (Cours TECH SS §VI.1.4)
+CT_TRANSIT_DH_PER_KWH = 0.0639   # DH/kWh HT
+TAUX_PERTES_RESEAU = 0.05         # 5 % plafonné (E_transitée = E_allouée × 0,95)
+
+# Taux de TVA (Cours TECH SS §VII.1)
+TVA_ENERGIE_PUISSANCE = 0.18      # 18 % sur RC + RP
+TVA_TRANSIT = 0.20                # 20 % sur RT (et entretien compteur)
+TVA_LOCATION_COMPTEUR = 0.15      # 15 %
+TVA_FACTURE_EEM = 0.10            # 10 % sur facture EEM
+
+# Coefficients RDPS pondérés par tranche (Cours TECH SS §VI.3.2)
+RDPS_WEIGHTS = {"hp": 1.0, "hpl": 0.6, "hc": 0.4}
+
+# Postes horaires saisonniers (Cours TECH SS §VI.1.2)
+#   HIVER : 01/10 → 31/03 ; ÉTÉ : 01/04 → 30/09
+HORAIRES_SAISON = {
+    "hiver": {"hp": (17, 22), "hpl": (7, 17), "hc_morning": (0, 7), "hc_evening": (22, 24)},
+    "ete":   {"hp": (18, 23), "hpl": (7, 18), "hc_morning": (0, 7), "hc_evening": (23, 24)},
+}
+
+
+def saison_du_mois(month: int) -> str:
+    """Hiver = oct→mars, Été = avr→sept (Cours TECH SS §VI.1.2)."""
+    return "hiver" if month in (10, 11, 12, 1, 2, 3) else "ete"
+
+
+def tranche_horaire(ts: datetime) -> str:
+    """Retourne 'hp', 'hpl' ou 'hc' selon l'heure et la saison."""
+    h = ts.hour
+    s = saison_du_mois(ts.month)
+    g = HORAIRES_SAISON[s]
+    if g["hp"][0] <= h < g["hp"][1]:
+        return "hp"
+    if g["hpl"][0] <= h < g["hpl"][1]:
+        return "hpl"
+    return "hc"
+
+
+# Répartition de l'énergie consommée 2025 (Reporting LGV déc. 2025) :
+# HP 23 % · HPL 61 % · HC 16 %.
 DEFAULT_HOURLY_SHARE = {"hp": 0.23, "hpl": 0.61, "hc": 0.16}
+
+
+# ---------------------------------------------------------------------------
+# Formules officielles ONEE — Cours TECH SS (LAGHRIBI Otmane, ONCF/DMI/SMCSSE)
+# ---------------------------------------------------------------------------
+
+def redevance_consommation(e_hp: float, e_hpl: float, e_hc: float, regime: dict) -> float:
+    """
+    RC = pHP × Cons_HP + pHPL × Cons_HPL + pHC × Cons_HC      (§VI.1.2)
+    Énergies en kWh, tarifs en DH/kWh, retour en DH HT.
+    """
+    return regime["hp"] * e_hp + regime["hpl"] * e_hpl + regime["hc"] * e_hc
+
+
+def redevance_puissance_souscrite(ps_kw_or_kva: float, prime_dh_per_year: float) -> float:
+    """
+    RPS = Pf / 12 × PS                                         (§VI.3.1 / §VI.3.2)
+    Pour TCU, PS = PS1 (heures de pointe) — confirmé par PS.xlsx.
+    Retour en DH HT par mois.
+    """
+    return prime_dh_per_year / 12.0 * ps_kw_or_kva
+
+
+def redevance_depassement_TG(pa_max_kva: float, ps_kva: float,
+                              prime_dh_kva_an: float, cos_phi: float = 0.95) -> float:
+    """
+    RDPS (Tarif Général) = 1,5 × Pf/12 × (PA - PS)             (§VI.3.1)
+    où PA = Pmax_appelée / cos φ. PA et PS en kVA.
+    """
+    pa_corrige = pa_max_kva / max(cos_phi, 0.01)
+    depassement = max(0.0, pa_corrige - ps_kva)
+    return 1.5 * prime_dh_kva_an / 12.0 * depassement
+
+
+def redevance_depassement_TCU(pa1_kw: float, pa2_kw: float, pa3_kw: float,
+                               ps1_kw: float, ps2_kw: float, ps3_kw: float,
+                               prime_dh_kw_an: float) -> float:
+    """
+    RDPS (Tarif Optionnel TCU) =
+       1,5 × Pf/12 × [ max(0, PA1-PS1)
+                       + 0,6 × max(0, PA2-PS2)
+                       + 0,4 × max(0, PA3-PS3) ]               (§VI.3.2)
+    Toutes les puissances en kW. Retour en DH HT par mois.
+    """
+    d1 = max(0.0, pa1_kw - ps1_kw)
+    d2 = max(0.0, pa2_kw - ps2_kw)
+    d3 = max(0.0, pa3_kw - ps3_kw)
+    return 1.5 * prime_dh_kw_an / 12.0 * (d1 + 0.6 * d2 + 0.4 * d3)
+
+
+def majoration_cos_phi(cos_phi: float, rc: float, rp: float, rdps: float) -> float:
+    """
+    Maj.(cos φ) = 2 × (0,9 - cos φ) × (RC + RP + RDPS) si cos φ < 0,9, sinon 0.
+    Cours TECH SS §VI.2.1.
+    """
+    if cos_phi >= 0.9:
+        return 0.0
+    return 2.0 * (0.9 - cos_phi) * (rc + rp + rdps)
+
+
+def cos_phi_from_energies(e_active_total: float, e_reactive_total: float) -> float:
+    """
+    cos φ = E_active / sqrt(E_active² + E_réactive²)            (§VI.2.2)
+    """
+    if e_active_total <= 0:
+        return 1.0
+    return e_active_total / math.sqrt(e_active_total ** 2 + e_reactive_total ** 2)
+
+
+def redevance_transit(e_allouee_kwh: float,
+                       ct: float = CT_TRANSIT_DH_PER_KWH,
+                       taux_pertes: float = TAUX_PERTES_RESEAU) -> float:
+    """
+    E_transitée = E_allouée × (1 - taux_pertes)                 (§VI.1.4)
+    RT = E_transitée × Ct ; Ct = 0,0639 DH/kWh HT.
+    """
+    return e_allouee_kwh * (1.0 - taux_pertes) * ct
+
+
+def montant_tva(rc: float, rp: float, rt: float, location: float = 0.0) -> float:
+    """
+    TVA = (RC + RP) × 18 % + RT × 20 % + Location × 15 %        (§VII.1)
+    """
+    return ((rc + rp) * TVA_ENERGIE_PUISSANCE
+            + rt * TVA_TRANSIT
+            + location * TVA_LOCATION_COMPTEUR)
+
+
+def penalite_kw_par_mois(prime_dh_kw_an: float, tranche: str = "hp") -> float:
+    """
+    Pénalité RDPS marginale en DH par kW dépassé par mois, pondérée par tranche.
+        Tranche HP  : 1,5 × Pf / 12
+        Tranche HPL : 1,5 × Pf / 12 × 0,6
+        Tranche HC  : 1,5 × Pf / 12 × 0,4
+    Cours TECH SS §VI.3.2.
+    """
+    weight = RDPS_WEIGHTS.get(tranche, 1.0)
+    return 1.5 * prime_dh_kw_an / 12.0 * weight
 
 # ---------------------------------------------------------------------------
 # Profils de vitesse / puissance (rapport EPGV §VII.2, en vigueur 15/07/2022)
@@ -795,11 +941,25 @@ with st.sidebar:
             min_value=1, max_value=50, value=15, step=1,
             help="≈ 30 trains/jour total sur la LGV en 2025 (rapport §7).",
         )
-        penalite_kva = st.number_input(
-            "Pénalité dépassement PS (DH/kW/mois)",
-            min_value=0, max_value=500, value=50, step=5,
-            help="≈ 1,5 × prime fixe mensuelle. Pénalités totales LGV "
-                 "2025 = 1,22 MDH (rapport §9).",
+        # Pénalité RDPS dérivée du Cours TECH SS §VI.3.2 :
+        #   1,5 × Pf/12 × poids_tranche, avec poids = 1 (HP), 0,6 (HPL), 0,4 (HC).
+        # Par défaut on suppose la tranche HP (worst case) ; l'utilisateur peut
+        # forcer une autre tranche pour étudier un croisement HPL ou HC.
+        tranche_croisement = st.selectbox(
+            "Tranche horaire du croisement",
+            options=["hp", "hpl", "hc"],
+            index=1,  # HPL par défaut (croisements diurnes les plus fréquents)
+            format_func=lambda x: {"hp": "Heures de pointe (HP, poids 1,0)",
+                                    "hpl": "Heures pleines (HPL, poids 0,6)",
+                                    "hc": "Heures creuses (HC, poids 0,4)"}[x],
+            help="Détermine le coefficient appliqué au dépassement dans la "
+                 "formule RDPS (Cours TECH SS §VI.3.2).",
+        )
+        penalite_kva = penalite_kw_par_mois(prime_fixe, tranche_croisement)
+        st.caption(
+            f"Pénalité dérivée : **{penalite_kva:.2f} DH/kW/mois** "
+            f"(= 1,5 × {prime_fixe:.0f}/12 × {RDPS_WEIGHTS[tranche_croisement]:.1f}). "
+            f"Pénalités totales LGV 2025 = 1,22 MDH (Reporting d'énergie LGV)."
         )
 
     st.markdown("---")
@@ -1357,12 +1517,13 @@ with tab4:
                     unsafe_allow_html=True,
                 )
 
-            # Estimation du gain en MAD
-            gain_par_evt = kva_evite * penalite_kva  # par mois si appliqué chaque jour
-            # Plus juste : pénalité = excédent × tarif × nb croisements concernés / mois
-            # On suppose 1 croisement / jour entre A et B (cas étudié), 30 j/mois.
-            gain_mois = kva_evite * penalite_kva  # MAD/mois pour cette paire
-            gain_an = gain_mois * 12
+            # Gain mensuel = ΔPmax_mensuel × pénalité_par_kW_par_mois.
+            # Cours TECH SS §VI.3.2 : la facturation RDPS retient le Pmax mensuel
+            # par tranche, donc déplacer un seul croisement suffit à effacer
+            # le dépassement de tout le mois (à condition qu'aucun autre
+            # croisement de la même paire ne reproduise le pic).
+            gain_mois = kva_evite * penalite_kva     # DH/mois
+            gain_an = gain_mois * 12                  # DH/an
 
             if kva_evite > 0:
                 st.markdown(
@@ -1379,7 +1540,8 @@ with tab4:
   </div>
   <div style="font-size:13px;opacity:0.85;margin-top:8px;">
     En retardant le Train Pair de {best['delay']:+.1f} min, on évite
-    <b>{kva_evite:,} KVA</b> de dépassement (pénalité {penalite_kva} MAD/KVA/mois).
+    <b>{kva_evite:,} KVA</b> de dépassement (pénalité {penalite_kva:.2f} DH/kW/mois,
+    tranche {tranche_croisement.upper()}, formule RDPS Cours TECH SS §VI.3.2).
   </div>
 </div>
 """.replace(",", " "),
@@ -1439,29 +1601,50 @@ with tab4:
                 )
                 st.plotly_chart(fig_scan, use_container_width=True)
 
-    with st.expander("ℹ️ Méthode de calcul du gain"):
-        st.markdown("""
-**Énergie par train** : intégration de la puissance par phase
-× durée de phase ; durée = longueur du segment / vitesse de phase.
+    with st.expander("ℹ️ Méthode de calcul du gain (formules officielles ONEE)"):
+        st.markdown(r"""
+Toutes les formules ci-dessous proviennent du **Cours TECH SS** (LAGHRIBI Otmane,
+ONCF / DMI / SMCSSE), §VI *Consommations d'énergie : calculs et redevances*.
+
+**Énergie par train** : intégration de la puissance par phase ×
+durée de phase ; durée = longueur du segment / vitesse de phase.
 
 **Profil de pic combiné** : pour chaque PK candidat de croisement, on
 suppose que les deux rames y sont simultanément et on additionne leur
-puissance instantanée selon leurs phases respectives à ce PK. Le résultat
-est converti en KVA (`kw / cosφ`, cosφ ≈ 0,95).
+puissance instantanée selon leurs phases respectives à ce PK. Conversion
+en kVA via $\cos\varphi \approx 0{,}95$.
 
-**Optimisation** : balayage de retards supplémentaires sur le Train Pair
-de −5 à +10 min (pas 30 s). Pour chaque retard, on recalcule le PK et
-l'instant du croisement, puis le pic combiné. On retient le retard qui
-minimise ce pic.
+**Redevance de consommation (§VI.1.2)**
+$$\mathrm{RC} = p_{HP}\,E_{HP} + p_{HPL}\,E_{HPL} + p_{HC}\,E_{HC}$$
 
-**Gain MAD** : la différence de dépassement de PS entre la situation
-nominale et la situation optimisée, multipliée par le tarif de pénalité
-(MAD/KVA/mois) — extrapolée sur 12 mois.
+**Redevance de puissance souscrite (§VI.3.2, TCU)**
+$$\mathrm{RPS} = \frac{Pf}{12} \times PS_1$$
+où $PS_1$ est la puissance souscrite en heures de pointe (confirmé par les
+fichiers PS.xlsx de l'ONCF).
 
-> ⚠ *Hypothèse simplificatrice :* la pénalité ONEE réelle dépend du
-> contrat (PMD, prime fixe, surfacturation des dépassements). Le chiffre
-> affiché reste un ordre de grandeur — à recaler avec le contrat exact
-> avant chiffrage final.
+**Redevance de dépassement (§VI.3.2, TCU)**
+$$\mathrm{RDPS} = 1{,}5 \times \frac{Pf}{12} \times
+\Big[\, \max(0, PA_1 - PS_1) + 0{,}6\,\max(0, PA_2 - PS_2)
++ 0{,}4\,\max(0, PA_3 - PS_3) \,\Big]$$
+
+**Majoration cos φ (§VI.2.1)** — appliquée si $\cos\varphi < 0{,}9$
+$$\mathrm{Maj.}(\cos\varphi) = 2 \times (0{,}9 - \cos\varphi)
+\times (\mathrm{RC} + \mathrm{RP} + \mathrm{RDPS})$$
+
+**Optimiseur de retard** : balayage des retards supplémentaires sur le
+Train Pair de −5 à +10 min (pas 30 s). Pour chaque retard, on recalcule
+PK et instant du croisement puis le pic combiné. On retient le retard
+qui minimise ce pic.
+
+**Gain MAD** : différence de dépassement entre situation nominale et
+optimisée × pénalité marginale par kW :
+$$\mathrm{P\acute{e}nalit\acute{e}} = 1{,}5 \times \frac{Pf}{12}
+\times \alpha_{\mathrm{tranche}}, \quad
+\alpha \in \{1 \text{ (HP)},\; 0{,}6 \text{ (HPL)},\; 0{,}4 \text{ (HC)}\}$$
+
+> Les valeurs sont des ordres de grandeur : la facturation réelle dépend
+> aussi du facteur de puissance, de la redevance de transit ($C_t = 0{,}0639$
+> DH/kWh) et des TVA différenciées (18 % / 20 % / 15 %).
 """)
 
 
