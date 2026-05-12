@@ -296,12 +296,15 @@ PHASE_SPEED_KMH = {
 }
 
 # Puissance électrique (kW) absorbée par rame, par phase (η = 0.86, RGV M).
+# Note "coast" : la valeur retenue (300 kW) correspond aux auxiliaires
+# embarqués (climatisation, éclairage, freinage rhéostatique) ; les anciennes
+# valeurs de 150 kW sous-estimaient la consommation réelle en marche sur l'erre.
 PHASE_POWER_KW_PER_RAME = {
     "accel290":  8500,
     "cruise290": 4843,
     "accel320":  9000,
     "cruise320": 6377,
-    "coast":     150,
+    "coast":     300,
 }
 
 
@@ -867,7 +870,11 @@ with st.sidebar:
 
     st.markdown("---")
     with st.expander("⚡ Puissances souscrites (PS)", expanded=True):
-        st.caption("Valeurs par défaut : plan hiver 2026 (rapport ONCF 12/2025).")
+        st.caption(
+            "Valeurs par défaut : plan hiver 2026 (Reporting d'énergie LGV 12/2025). "
+            "**Capacité physique installée** : 40 MVA par SST LGV ; la PS contractuelle "
+            "(12,5 à 16 MW) est nettement inférieure pour optimiser la prime fixe."
+        )
         ps_aouama = st.number_input(
             "AOUAMA SST1 — Secteur Nord (kW)",
             min_value=1000, max_value=40000,
@@ -884,6 +891,28 @@ with st.sidebar:
             value=4850, step=50, key="ps_moghogha",
             help="Sous-station hors LGV (LC Tanger) — incluse "
                  "dans la facturation globale ONCF.",
+        )
+
+        # Garde-fou : pic historique observé sur chaque SST (rapport EPGV).
+        # Si la PS saisie est inférieure, on alerte l'utilisateur.
+        PIC_HIST_AOUAMA_KW = 22000   # Pic 2024 El Ouama (chap. 2)
+        PIC_HIST_OULAD_KW = 20000    # Pic 2024 Oulad Slama (chap. 2)
+        if ps_aouama < PIC_HIST_AOUAMA_KW:
+            st.warning(
+                f"⚠ PS AOUAMA = {ps_aouama:,} kW < pic historique 2024 "
+                f"({PIC_HIST_AOUAMA_KW:,} kW). RDPS quasi-garanties chaque été."
+                .replace(",", " ")
+            )
+        if ps_oulad < PIC_HIST_OULAD_KW:
+            st.warning(
+                f"⚠ PS OULED SLAMA = {ps_oulad:,} kW < pic historique 2024 "
+                f"({PIC_HIST_OULAD_KW:,} kW). RDPS quasi-garanties chaque été."
+                .replace(",", " ")
+            )
+        st.caption(
+            "💡 *Recommandation pratique* : prévoir une marge d'exploitation "
+            "de 5 à 10 % au-dessus du pic prévisible "
+            "($PS_{\\min} \\approx 1{,}1 \\times P_{\\max}$)."
         )
 
     with st.expander("💰 Régime tarifaire", expanded=True):
@@ -939,8 +968,24 @@ with st.sidebar:
         trains_per_day = st.number_input(
             "Circulations / jour / sens",
             min_value=1, max_value=50, value=15, step=1,
-            help="≈ 30 trains/jour total sur la LGV en 2025 (rapport §7).",
+            help="≈ 30 trains/jour total sur la LGV en 2025 "
+                 "(10 301 US + 1 487 UM, Reporting d'énergie déc. 2025).",
         )
+        um_share = st.slider(
+            "Part de circulations UM (%)",
+            min_value=0, max_value=50,
+            value=int(round(1487 / (10301 + 1487) * 100)),  # ≈ 12,6 %
+            step=1,
+            help="Fraction des circulations en composition UM (2 rames couplées). "
+                 "Référence 2025 : 1 487 UM sur 11 788 trains commerciaux (≈ 12,6 %).",
+        ) / 100.0
+        realisme_factor = st.slider(
+            "Facteur de réalisme des gains (%)",
+            min_value=30, max_value=100, value=60, step=5,
+            help="Atténuation appliquée aux gains théoriques pour tenir compte "
+                 "des contraintes d'exploitation (régularité, sécurité, fenêtre "
+                 "horaire). 60 % = valeur prudente recommandée.",
+        ) / 100.0
         # Pénalité RDPS dérivée du Cours TECH SS §VI.3.2 :
         #   1,5 × Pf/12 × poids_tranche, avec poids = 1 (HP), 0,6 (HPL), 0,4 (HC).
         # Par défaut on suppose la tranche HP (worst case) ; l'utilisateur peut
@@ -1326,30 +1371,33 @@ with tab4:
     )
 
     # ---------- (i) Énergie -----------------------------------------------
-    # daily_kwh = (E_A + E_B) × trains_per_day, où trains_per_day est /sens.
-    # train_energy_kwh() prend déjà en compte n_rames (UM = 2× US),
-    # donc on n'applique pas de pondération supplémentaire ici.
-    e_train_a = train_energy_kwh(train_a)
-    e_train_b = train_energy_kwh(train_b)
-    daily_kwh = (e_train_a + e_train_b) * trains_per_day
+    # daily_kwh = (E_A * total_trains_per_day) + (E_B * total_trains_per_day)
+    # où total_trains_per_day est le nombre de circulations dans CE sens
+    # (Train A : Tanger→Kenitra ; Train B : Kenitra→Tanger).
+    # train_energy_kwh() prend déjà en compte n_rames (UM = 2× US) pour
+    # le train que l'utilisateur a sélectionné. Pour estimer le mix réel
+    # 2025, on combine US et UM via la part UM saisie en sidebar.
+    e_train_a_us = train_energy_kwh(train_a) / max(train_a.n_rames, 1)
+    e_train_b_us = train_energy_kwh(train_b) / max(train_b.n_rames, 1)
+    # Énergie moyenne par circulation = (1-um_share)·E_US + um_share·E_UM
+    # où E_UM = 2·E_US.
+    e_avg_a = e_train_a_us * (1.0 + um_share)   # = (1-x)·1 + x·2
+    e_avg_b = e_train_b_us * (1.0 + um_share)
+    daily_kwh = (e_avg_a + e_avg_b) * trains_per_day
     daily_energy_cost = daily_kwh * tarif_kwh
     yearly_energy = daily_energy_cost * 365
-
-    # Référence reporting 2025 pour calibration : 48,9 GWh consommés sur
-    # 10 301 US + 1 487 UM → l'utilisateur peut ajuster trains_per_day,
-    # composition (US/UM) et profil (Éco/Normale) pour s'en approcher.
+    yearly_energy_gwh = daily_kwh * 365 / 1e6
 
     # ---------- (ii) RPS LGV (sur PS1 — équivalent kW HP) -----------------
-    # Pour les deux SST LGV (AOUAMA + OULED SLAMA). Cours TECH SS §VI.3.2 :
-    # RPS = Pf/12 × PS1, donc RPS annuelle = Pf × PS1 par SST.
+    # Cours TECH SS §VI.3.2 : RPS = Pf/12 × PS1 (par SST).
     rps_aouama_an = ps_aouama * prime_fixe
     rps_oulad_an = ps_oulad * prime_fixe
     rps_lgv_an = rps_aouama_an + rps_oulad_an
 
-    # ---------- (iii) RDPS référence (Reporting 2025) ---------------------
-    # 1,22 MDH/an pour la LGV — base réelle ; sera réduite par l'optimiseur.
-    RDPS_LGV_REF_2025 = 1_220_000.0
-    RDPS_MOGHOGHA_REF_2025 = 150_000.0
+    # ---------- (iii) RDPS référence (Reporting d'énergie LGV déc. 2025) --
+    # Source officielle : Reporting d'énergie LGV à fin 2025 (§9 Pénalités).
+    RDPS_LGV_REF_2025 = 1_220_000.0       # 1,22 MDH (LGV)
+    RDPS_MOGHOGHA_REF_2025 = 150_000.0    # 0,15 MDH (Moghogha)
 
     # ---------- (iv) Bloc Moghogha (hors LGV, optionnel) -------------------
     inclure_moghogha = st.toggle(
@@ -1358,16 +1406,24 @@ with tab4:
         help="Moghogha alimente l'approche LC de Tanger ; bien que hors "
              "LGV, elle est intégrée à la facture globale ONCF.",
     )
+    # Hypothèse simplificatrice : Moghogha représente ~20 % de l'énergie
+    # totale (estimation indicative dérivée du surcoût 926 DH/train US
+    # constaté dans le Reporting 2025 ; à valider sur données SCADA réelles).
+    SHARE_MOGHOGHA = 0.20
     rps_moghogha_an = ps_moghogha * prime_fixe
-    # Moghogha consomme ~5 % de l'énergie totale (estimé à partir de
-    # l'écart 4431-3505 = 926 DH/train ≈ 1/4 de coût LGV).
-    energy_moghogha_an = yearly_energy * 0.20      # ≈ 20 % de l'énergie
+    energy_moghogha_an = yearly_energy * SHARE_MOGHOGHA
     rdps_moghogha_an = RDPS_MOGHOGHA_REF_2025 if inclure_moghogha else 0.0
     moghogha_total = (rps_moghogha_an + energy_moghogha_an + rdps_moghogha_an
                       ) if inclure_moghogha else 0.0
+    if inclure_moghogha:
+        st.caption(
+            f"ℹ️ Hypothèse simplificatrice : Moghogha représente "
+            f"{SHARE_MOGHOGHA*100:.0f} % de l'énergie totale "
+            f"(à recaler sur données SCADA réelles)."
+        )
 
     # ---------- (v) Total LGV + Moghogha ----------------------------------
-    energy_lgv_an = yearly_energy * (0.80 if inclure_moghogha else 1.0)
+    energy_lgv_an = yearly_energy * (1 - SHARE_MOGHOGHA if inclure_moghogha else 1.0)
     lgv_total = energy_lgv_an + rps_lgv_an + RDPS_LGV_REF_2025
     yearly_total = lgv_total + moghogha_total
 
@@ -1426,9 +1482,15 @@ with tab4:
 
     # ---------- (viii) Calibration vs Reporting 2025 ----------------------
     REEL_2025 = 48_880_000.0
+    REEL_2025_GWH = 48.9
     ecart = yearly_total - REEL_2025
     pct_ecart = ecart / REEL_2025 * 100
     color = "#27ae60" if abs(pct_ecart) < 5 else "#f39c12" if abs(pct_ecart) < 15 else "#c0392b"
+
+    # Calibration énergétique : Erreur = |E_sim - E_réel| / E_réel
+    ecart_energie = yearly_energy_gwh - REEL_2025_GWH
+    pct_ecart_energie = ecart_energie / REEL_2025_GWH * 100
+    color_e = "#27ae60" if abs(pct_ecart_energie) < 5 else "#f39c12" if abs(pct_ecart_energie) < 15 else "#c0392b"
 
     st.markdown(
         f"""
@@ -1446,9 +1508,12 @@ with tab4:
   • Pénalités dépassement 2025 : <b>1,22 MDH</b> (LGV)
     + 0,15 MDH (MOGHOGHA)<br>
   <hr style='margin:6px 0;border:none;border-top:1px solid #d5dbdb;'>
-  <b>Calibration de la simulation actuelle :</b>
+  <b>Calibration financière :</b>
   estimation <b>{yearly_total/1e6:.2f} MDH</b> · réel 2025 <b>48,88 MDH</b>
-  · écart <b style='color:{color}'>{ecart/1e6:+.2f} MDH ({pct_ecart:+.1f} %)</b>.
+  · écart <b style='color:{color}'>{ecart/1e6:+.2f} MDH ({pct_ecart:+.1f} %)</b>.<br>
+  <b>Calibration énergétique :</b>
+  estimation <b>{yearly_energy_gwh:.2f} GWh</b> · réel 2025 <b>48,9 GWh</b>
+  · écart <b style='color:{color_e}'>{ecart_energie:+.2f} GWh ({pct_ecart_energie:+.1f} %)</b>.
 </div>
 """,
         unsafe_allow_html=True,
@@ -1596,35 +1661,77 @@ with tab4:
                     unsafe_allow_html=True,
                 )
 
-            # Gain mensuel = ΔPmax_mensuel × pénalité_par_kW_par_mois.
-            # Cours TECH SS §VI.3.2 : la facturation RDPS retient le Pmax mensuel
-            # par tranche, donc déplacer un seul croisement suffit à effacer
-            # le dépassement de tout le mois (à condition qu'aucun autre
-            # croisement de la même paire ne reproduise le pic).
-            gain_mois = kva_evite * penalite_kva     # DH/mois
-            gain_an = gain_mois * 12                  # DH/an
+            # ─── Décomposition explicite du gain (3 catégories séparées) ───
+            # Cours TECH SS §VI : on évite tout double comptage en distinguant
+            #   Gain_E    = (E_normal - E_optimisé) × tarif       [HT]
+            #   Gain_RDPS = RDPS_normal - RDPS_optimisé           [HT]
+            #   Gain_RPS  = RPS_normal  - RPS_optimisé            [HT]
+            # Le déplacement d'un croisement réduit avant tout les pics (RDPS),
+            # pas l'énergie totale — donc Gain_E ≈ 0 et Gain_RPS = 0
+            # (la PS contractuelle ne change pas dans ce levier).
+
+            # Gain RDPS (annuel) — extrapolation prudente d'un croisement
+            # journalier × 365 j, atténuée par le facteur de réalisme.
+            gain_rdps_brut_an = kva_evite * penalite_kva * 12  # DH/an
+            gain_rdps_realiste = gain_rdps_brut_an * realisme_factor
+
+            # Gain énergie (annuel) — minime : décaler ≠ rouler moins.
+            # On ne retient que la fraction marginale (typique 1-2 %).
+            gain_energie_an = 0.0  # Le levier "retard" n'économise pas d'énergie.
+
+            # Gain RPS (annuel) — nul, la PS contractuelle reste inchangée.
+            gain_rps_an = 0.0
+
+            gain_total_an = gain_energie_an + gain_rdps_realiste + gain_rps_an
 
             if kva_evite > 0:
+                # Bandeau principal avec décomposition transparente
                 st.markdown(
                     f"""
 <div style="margin-top:14px;padding:18px;border-radius:10px;
             background:linear-gradient(135deg,#27ae60 0%,#16a085 100%);
             color:white;">
-  <div style="font-size:14px;opacity:0.9;">💰 Gain estimé pour cette paire</div>
+  <div style="font-size:14px;opacity:0.9;">💰 Gain estimé pour cette paire (annuel, HT)</div>
   <div style="font-size:32px;font-weight:800;line-height:1.2;margin:6px 0;">
-    ≈ {gain_mois:,.0f} MAD / mois
+    ≈ {gain_total_an:,.0f} MAD / an
   </div>
-  <div style="font-size:18px;opacity:0.95;">
-    soit <b>≈ {gain_an:,.0f} MAD / an</b>
-  </div>
-  <div style="font-size:13px;opacity:0.85;margin-top:8px;">
+  <div style="font-size:13px;opacity:0.9;margin-top:8px;">
     En retardant le Train Pair de {best['delay']:+.1f} min, on évite
-    <b>{kva_evite:,} KVA</b> de dépassement (pénalité {penalite_kva:.2f} DH/kW/mois,
-    tranche {tranche_croisement.upper()}, formule RDPS Cours TECH SS §VI.3.2).
+    <b>{kva_evite:,} kW</b> de dépassement RDPS (tranche {tranche_croisement.upper()}).
+    Facteur de réalisme appliqué : <b>{realisme_factor*100:.0f}%</b>.
   </div>
 </div>
 """.replace(",", " "),
                     unsafe_allow_html=True,
+                )
+
+                # Tableau de décomposition des 3 gains (transparence totale)
+                gains_decomp = pd.DataFrame([
+                    {"Catégorie de gain": "🔋 Gain énergie (Gain_E)",
+                     "Annuel (DH HT)": f"{gain_energie_an:,.0f}".replace(",", " "),
+                     "Note": "Quasi nul : déplacer un croisement ≠ rouler moins."},
+                    {"Catégorie de gain": "⚠️ Gain RDPS brut",
+                     "Annuel (DH HT)": f"{gain_rdps_brut_an:,.0f}".replace(",", " "),
+                     "Note": f"{kva_evite:,} kW × {penalite_kva:.2f} DH/kW/mois × 12 mois"
+                             .replace(",", " ")},
+                    {"Catégorie de gain": f"⚠️ Gain RDPS réaliste (×{realisme_factor:.0%})",
+                     "Annuel (DH HT)": f"{gain_rdps_realiste:,.0f}".replace(",", " "),
+                     "Note": "Atténuation pour contraintes d'exploitation."},
+                    {"Catégorie de gain": "🏛️ Gain RPS (Gain_RPS)",
+                     "Annuel (DH HT)": f"{gain_rps_an:,.0f}".replace(",", " "),
+                     "Note": "Nul : la PS contractuelle reste inchangée."},
+                    {"Catégorie de gain": "💰 TOTAL Gain (réaliste)",
+                     "Annuel (DH HT)": f"{gain_total_an:,.0f}".replace(",", " "),
+                     "Note": "Gain_total = Gain_E + Gain_RDPS + Gain_RPS"},
+                ])
+                st.dataframe(gains_decomp, use_container_width=True, hide_index=True)
+
+                st.caption(
+                    "⚠️ *Hypothèses* : extrapolation d'un croisement journalier sur "
+                    "365 jours ; pénalité dérivée du Cours TECH SS §VI.3.2 "
+                    "(formule RDPS pondérée). Le gain réel dépend de la "
+                    "régularité d'application et de l'absence d'autres croisements "
+                    "produisant le même pic dans le mois."
                 )
             else:
                 st.info(
@@ -1715,15 +1822,29 @@ Train Pair de −5 à +10 min (pas 30 s). Pour chaque retard, on recalcule
 PK et instant du croisement puis le pic combiné. On retient le retard
 qui minimise ce pic.
 
-**Gain MAD** : différence de dépassement entre situation nominale et
-optimisée × pénalité marginale par kW :
+**Gain décomposé en 3 catégories indépendantes (évite tout double comptage) :**
+
+$$\mathrm{Gain}_E = (E_{\mathrm{normal}} - E_{\mathrm{optimis\acute{e}}}) \times \overline{\tau}$$
+$$\mathrm{Gain}_{\mathrm{RDPS}} = \mathrm{RDPS}_{\mathrm{normal}} - \mathrm{RDPS}_{\mathrm{optimis\acute{e}}}$$
+$$\mathrm{Gain}_{\mathrm{RPS}} = \mathrm{RPS}_{\mathrm{normal}} - \mathrm{RPS}_{\mathrm{optimis\acute{e}}}$$
+$$\mathrm{Gain}_{\mathrm{total}} = \mathrm{Gain}_E + \mathrm{Gain}_{\mathrm{RDPS}} + \mathrm{Gain}_{\mathrm{RPS}}$$
+
+Pour le levier *retard de croisement* :
+- $\mathrm{Gain}_E \approx 0$ : décaler un croisement ne fait pas rouler moins.
+- $\mathrm{Gain}_{\mathrm{RPS}} = 0$ : la PS contractuelle ne change pas.
+- $\mathrm{Gain}_{\mathrm{RDPS}}$ est le seul levier réel ; on lui applique un
+  **facteur de réalisme** (60 % par défaut) pour tenir compte des
+  contraintes d'exploitation (régularité, sécurité, fenêtre horaire).
+
+**Pénalité unitaire** :
 $$\mathrm{P\acute{e}nalit\acute{e}} = 1{,}5 \times \frac{Pf}{12}
 \times \alpha_{\mathrm{tranche}}, \quad
 \alpha \in \{1 \text{ (HP)},\; 0{,}6 \text{ (HPL)},\; 0{,}4 \text{ (HC)}\}$$
 
-> Les valeurs sont des ordres de grandeur : la facturation réelle dépend
-> aussi du facteur de puissance, de la redevance de transit ($C_t = 0{,}0639$
-> DH/kWh) et des TVA différenciées (18 % / 20 % / 15 %).
+> Les valeurs sont des ordres de grandeur (HT) : la facturation réelle
+> dépend aussi du facteur de puissance, de la redevance de transit
+> ($C_t = 0{,}0639$ DH/kWh) et des TVA différenciées (18 % / 20 % / 15 %).
+> Toutes les économies sont annoncées en MAD HT.
 """)
 
 
